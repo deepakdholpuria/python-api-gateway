@@ -1,0 +1,39 @@
+version: '3'
+
+services:
+  gateway-router:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.ini:/app/config.ini
+      - ./hooks.py:/app/hooks.py
+      - ./logs:/app/logs
+    environment:
+      - TZ=UTC
+    restart: unless-stopped
+    command: python gateway_router.py --port 8080
+    networks:
+      - gateway-network
+
+  # Uncomment this if you want to run Oracle XE container for development
+  # oracle-db:
+  #   image: gvenzl/oracle-xe:21
+  #   ports:
+  #     - "1521:1521"
+  #   environment:
+  #     - ORACLE_PASSWORD=password
+  #     - APP_USER=gateway_user
+  #     - APP_USER_PASSWORD=gateway_password
+  #   volumes:
+  #     - oracle-data:/opt/oracle/oradata
+  #     - ./database_setup.sql:/container-entrypoint-initdb.d/database_setup.sql
+  #   networks:
+  #     - gateway-network
+
+networks:
+  gateway-network:
+    driver: bridge
+
+volumes:
+  oracle-data:
