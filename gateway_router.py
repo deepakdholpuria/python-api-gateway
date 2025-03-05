@@ -29,24 +29,39 @@ from typing import Dict, Any, Optional, List
 import requests
 try:
     import oracledb
+    HAS_ORACLE = True
+    print("Successfully imported Oracle database module")
 except ImportError:
     try:
         import cx_Oracle as oracledb
+        HAS_ORACLE = True
+        print("Successfully imported cx_Oracle module")
     except ImportError:
-        print("Error: Neither oracledb nor cx_Oracle package is installed.")
-        print("Install one of them using pip: pip install oracledb")
-        sys.exit(1)
+        print("Warning: Oracle database packages (oracledb/cx_Oracle) not found.")
+        print("Using mock database interface instead.")
+        oracledb = None
+        HAS_ORACLE = False
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('gateway_router.log')
-    ]
-)
+# Configure logging with explicit handlers
+console_handler = logging.StreamHandler(sys.stdout)
+file_handler = logging.FileHandler('gateway_router.log')
+
+log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(log_format)
+file_handler.setFormatter(log_format)
+
 logger = logging.getLogger('GatewayRouter')
+logger.setLevel(logging.INFO)
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
+
+# Clear any existing handlers to avoid duplicates
+for handler in logger.handlers[:]:
+    if handler not in [console_handler, file_handler]:
+        logger.removeHandler(handler)
+
+# Force immediate output
+console_handler.setLevel(logging.INFO)
 
 class Configuration:
     """Configuration manager for the gateway router application."""
@@ -89,6 +104,12 @@ class Configuration:
             'post_response': 'hooks.post_response'
         }
         
+        self.config['CERTIFICATES'] = {
+            'cert_dir': './certs',
+            'verify_ssl': 'true',
+            'default_ca_cert': 'ca.pem'
+        }
+        
         # Write the configuration to file
         with open(config_file, 'w') as f:
             self.config.write(f)
@@ -120,6 +141,30 @@ class Configuration:
         if 'HOOKS' not in self.config:
             return {}
         return dict(self.config['HOOKS'])
+    
+    def get_cert_config(self) -> Dict[str, Any]:
+        """Get certificate configuration."""
+        # Safe defaults
+        cert_config = {
+            'cert_dir': './certs',
+            'verify_ssl': True,
+            'default_ca_cert': None,
+            'server_certs': {}
+        }
+        
+        # Try to load from config if available
+        if 'CERTIFICATES' in self.config:
+            cert_config['cert_dir'] = self.config.get('CERTIFICATES', 'cert_dir', fallback='./certs')
+            cert_config['verify_ssl'] = self.config.getboolean('CERTIFICATES', 'verify_ssl', fallback=True)
+            cert_config['default_ca_cert'] = self.config.get('CERTIFICATES', 'default_ca_cert', fallback=None)
+            
+            # Get server-specific certificates
+            for key, value in self.config['CERTIFICATES'].items():
+                if key.startswith('server_cert_'):
+                    server_name = key[12:]  # Remove 'server_cert_' prefix
+                    cert_config['server_certs'][server_name] = value
+        
+        return cert_config
 
 
 class DatabaseManager:
@@ -135,12 +180,16 @@ class DatabaseManager:
         
     def initialize(self):
         """Initialize the connection pool."""
+        if not HAS_ORACLE:
+            raise Exception("Oracle database module not available")
+            
         try:
             # Try to use thin mode (pure Python implementation)
             try:
                 oracledb.init_oracle_client(lib_dir=None)
-            except Exception:
-                # If failed, continue without initialization
+            except Exception as e:
+                logger.warning(f"Could not initialize Oracle client: {e}")
+                # Continue without initialization
                 pass
                 
             self.pool = oracledb.create_pool(
@@ -192,7 +241,7 @@ class DatabaseManager:
 class MockDatabaseManager:
     """Mock database manager for testing."""
     
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any] = None):
         """Initialize the mock database manager."""
         self.routes = [
             {
@@ -396,7 +445,7 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _get_request_body(self) -> bytes:
         """Get the request body."""
         content_length = int(self.headers.get('Content-Length', 0))
-        return self.rfile.read(content_length)
+        return self.rfile.read(content_length) if content_length > 0 else b''
     
     def _get_request_headers(self) -> Dict[str, str]:
         """Get request headers as a dictionary."""
@@ -405,8 +454,7 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _build_request_url(self) -> str:
         """Build the full request URL."""
         host = self.headers.get('Host', 'localhost')
-        scheme = 'https' if self.server.socket.family == socket.AF_INET6 else 'http'
-        return f"{scheme}://{host}{self.path}"
+        return f"http://{host}{self.path}"
     
     def _generate_trace_id(self) -> str:
         """Generate a unique trace ID for request tracing."""
@@ -430,9 +478,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         
         # Log incoming request
         logger.info(f"[{trace_id}] Incoming {method} request to {request_url}")
-        logger.debug(f"[{trace_id}] Headers: {request_headers}")
-        if request_body:
-            logger.debug(f"[{trace_id}] Body: {request_body[:1000]}...")
         
         # Find route
         route = self.route_manager.find_route(request_url)
@@ -465,91 +510,83 @@ class RequestHandler(BaseHTTPRequestHandler):
             filtered_headers = {k: v for k, v in request_headers.items() if k not in headers_to_remove}
             
             # Log filtered headers being sent
-            logger.info(f"[{trace_id}] Sending request to {target_url} with headers: {filtered_headers}")
+            logger.info(f"[{trace_id}] Sending request to {target_url}")
             
-            # Execute request to target server - CRITICAL FIX: set stream=False to get full response immediately
+            # Set up SSL verification - Simple and safe
+            verify = True  # Default to standard SSL verification
+            
+            # Check if we have certificate config on the server
+            try:
+                if hasattr(self.server, 'cert_config'):
+                    cert_config = self.server.cert_config
+                    cert_dir = cert_config.get('cert_dir', './certs')
+                    verify = cert_config.get('verify_ssl', True)
+                    
+                    # Get the server name from the route
+                    server_name = route.get('replaced_variables')
+                    
+                    # Try to use server-specific certificate if available
+                    if server_name and server_name in cert_config.get('server_certs', {}):
+                        cert_filename = cert_config['server_certs'][server_name]
+                        cert_path = os.path.join(cert_dir, cert_filename)
+                        
+                        if os.path.exists(cert_path):
+                            verify = cert_path
+                            logger.info(f"[{trace_id}] Using certificate for {server_name}: {cert_path}")
+                    
+                    # If no server-specific cert but we have a default CA cert
+                    elif verify and cert_config.get('default_ca_cert'):
+                        default_ca_path = os.path.join(cert_dir, cert_config['default_ca_cert'])
+                        if os.path.exists(default_ca_path):
+                            verify = default_ca_path
+                            logger.info(f"[{trace_id}] Using default CA certificate: {default_ca_path}")
+            except Exception as e:
+                logger.warning(f"[{trace_id}] Error setting up SSL verification, using defaults: {e}")
+                verify = True
+            
+            # Execute request to target server
             response = requests.request(
                 method=method,
                 url=target_url,
                 headers=filtered_headers,
                 data=request_body,
                 allow_redirects=False,
-                stream=False,  # CRITICAL: This ensures we fully download content before proceeding
-                timeout=30     # Default timeout
+                stream=False,
+                timeout=30,
+                verify=verify
             )
             
-            # Immediately log the raw response details
-            logger.info(f"[{trace_id}] Raw response status: {response.status_code}")
-            logger.info(f"[{trace_id}] Raw response headers: {dict(response.headers)}")
-            logger.info(f"[{trace_id}] Raw response encoding: {response.encoding}")
-            logger.info(f"[{trace_id}] Raw response content length: {len(response.content) if response.content else 0} bytes")
+            # Get response headers
+            response_headers = {k: v for k, v in response.headers.items()}
+            response_headers['X-Gateway-Trace-ID'] = trace_id
             
             # Execute post-request hook
             modified_response = self.hook_manager.execute_hook('post_request', response, trace_id, target_url)
             if modified_response and isinstance(modified_response, requests.Response):
                 response = modified_response
             
-            # Get response headers
-            response_headers = {k: v for k, v in response.headers.items()}
-            response_headers['X-Gateway-Trace-ID'] = trace_id
-            
-            # CRITICAL FIX: Handle gzipped content correctly
-            if 'Content-Encoding' in response_headers and 'gzip' in response_headers['Content-Encoding'].lower():
-                logger.info(f"[{trace_id}] Content is gzipped, preserving Content-Encoding header")
-                # No need to decompress, requests already handles this internally
-            
             # Execute pre-response hook
             modified_headers = self.hook_manager.execute_hook('pre_response', response_headers, trace_id, target_url)
             if modified_headers and isinstance(modified_headers, dict):
                 response_headers = modified_headers
             
-            # CRITICAL FIX: Handle Transfer-Encoding properly
+            # Remove Transfer-Encoding if chunked (we're not actually chunking)
             if 'Transfer-Encoding' in response_headers and 'chunked' in response_headers['Transfer-Encoding'].lower():
-                logger.info(f"[{trace_id}] Chunked encoding detected, removing Transfer-Encoding header")
-                # Remove the Transfer-Encoding header as we're not actually chunking the response
+                logger.info(f"[{trace_id}] Removing Transfer-Encoding header")
                 del response_headers['Transfer-Encoding']
             
-            # Ensure correct Content-Length
+            # Ensure Content-Length is set
             if 'Content-Length' not in response_headers and response.content:
                 content_length = len(response.content)
-                logger.info(f"[{trace_id}] Adding missing Content-Length header: {content_length}")
+                logger.info(f"[{trace_id}] Adding Content-Length header: {content_length}")
                 response_headers['Content-Length'] = str(content_length)
             
-            # Debug check if we're processing application/json content
-            content_type = response_headers.get('Content-Type', '').lower()
-            if 'application/json' in content_type:
-                logger.info(f"[{trace_id}] JSON content detected, preview: {response.text[:200] if response.text else 'empty'}")
-            
-            # Send response headers
+            # Send response
             self._set_response(response.status_code, response_headers)
             
-            # Enhanced debugging for response handling
-            logger.info(f"[{trace_id}] Response content type: {response.headers.get('Content-Type', 'None')}")
-            logger.info(f"[{trace_id}] Response content length: {len(response.content) if response.content else 0} bytes")
-            
-            # Log the response content for debugging (first 500 bytes)
+            # Send response body
             if response.content:
-                content_preview = response.content[:500]
-                try:
-                    # Try to decode as UTF-8 for better logging
-                    content_str = content_preview.decode('utf-8')
-                    logger.info(f"[{trace_id}] Response content preview: {content_str}")
-                except UnicodeDecodeError:
-                    # If it's binary data, log the hex representation
-                    logger.info(f"[{trace_id}] Response content preview (binary): {content_preview.hex()[:100]}")
-                
-                # CRITICAL FIX: Send the response body with proper error handling
-                try:
-                    self.wfile.write(response.content)
-                    logger.info(f"[{trace_id}] Response body successfully written to client, length: {len(response.content)} bytes")
-                except BrokenPipeError:
-                    logger.error(f"[{trace_id}] Client disconnected while sending response (BrokenPipeError)")
-                except ConnectionResetError:
-                    logger.error(f"[{trace_id}] Connection reset by client while sending response")
-                except Exception as e:
-                    logger.error(f"[{trace_id}] Error writing response body to client: {str(e)}")
-            else:
-                logger.warning(f"[{trace_id}] Empty response body from {target_url}")
+                self.wfile.write(response.content)
             
             # Calculate response time
             response_time_ms = (time.time() - request_start_time) * 1000
@@ -596,14 +633,7 @@ class RequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         """Override log_message to use our logger instead of stderr."""
         # This prevents the default logging from http.server
-        # We're doing our own logging with the logger module
         pass
-
-
-class HTTPServerV6(HTTPServer):
-    """HTTP server with IPv6 support."""
-    
-    address_family = socket.AF_INET6
 
 
 class GatewayRouter:
@@ -619,19 +649,16 @@ class GatewayRouter:
     
     def initialize(self):
         """Initialize all components."""
+        print("Initializing Gateway Router components...")
+        sys.stdout.flush()
+        
         # Initialize database manager
         db_config = self.config.get_db_config()
         
-        # Use mock database manager instead of real one for development
-        # self.db_manager = DatabaseManager(db_config)  # Real database
-        self.db_manager = MockDatabaseManager(db_config)  # Mock database
-        
-        try:
-            self.db_manager.initialize()
-        except Exception as e:
-            logger.warning(f"Could not initialize database, using mock: {e}")
-            self.db_manager = MockDatabaseManager(db_config)
-            self.db_manager.initialize()
+        # Always use the mock database manager for compatibility
+        print("Using mock database manager for stability")
+        self.db_manager = MockDatabaseManager(db_config)
+        self.db_manager.initialize()
         
         # Initialize route manager
         servers_mapping = self.config.get_servers_mapping()
@@ -641,6 +668,7 @@ class GatewayRouter:
         hooks_config = self.config.get_hooks_config()
         self.hook_manager = HookManager(hooks_config)
         
+        print("Gateway Router initialized successfully")
         logger.info("Gateway Router initialized successfully")
     
     def start(self):
@@ -648,6 +676,9 @@ class GatewayRouter:
         server_config = self.config.get_server_config()
         host = server_config['host']
         port = server_config['port']
+        
+        # Get certificate configuration
+        cert_config = self.config.get_cert_config()
         
         # Create request handler class with our managers
         handler = lambda *args, **kwargs: RequestHandler(
@@ -659,20 +690,29 @@ class GatewayRouter:
         
         # Create and start HTTP server
         try:
-            # Try IPv6 first
-            self.server = HTTPServerV6((host, port), handler)
-            logger.info(f"Starting server on [{host}]:{port} (IPv6)")
-        except Exception as e:
-            logger.info(f"IPv6 not supported, falling back to IPv4: {e}")
-            # Fall back to IPv4
+            # Simplified: Just use IPv4 for reliability
+            print(f"Starting server on {host}:{port}")
+            sys.stdout.flush()
             self.server = HTTPServer((host, port), handler)
-            logger.info(f"Starting server on {host}:{port} (IPv4)")
-        
-        try:
+            
+            # Set certificate configuration
+            self.server.cert_config = cert_config
+            
+            logger.info(f"Starting server on {host}:{port}")
+            
+            print("Server started. Press Ctrl+C to stop.")
+            sys.stdout.flush()
             logger.info("Server started. Press Ctrl+C to stop.")
+            
+            # Start the server
             self.server.serve_forever()
         except KeyboardInterrupt:
+            print("\nServer stopping due to keyboard interrupt...")
             logger.info("Server stopping...")
+        except Exception as e:
+            print(f"Error starting server: {e}")
+            logger.error(f"Error starting server: {e}")
+            print(traceback.format_exc())
         finally:
             self.stop()
     
@@ -690,10 +730,21 @@ class GatewayRouter:
 
 def main():
     """Main entry point for the gateway router application."""
+    # Print directly to stdout to ensure visibility
+    print("Gateway Router starting...")
+    print("-------------------------")
+    
     parser = argparse.ArgumentParser(description='Gateway Router')
     parser.add_argument('--config', '-c', default='config.ini', help='Path to configuration file')
     parser.add_argument('--port', '-p', type=int, help='Server port to use (overrides config file)')
+    parser.add_argument('--debug', '-d', action='store_true', help='Enable debug mode with verbose logging')
     args = parser.parse_args()
+    
+    # Set debug level if requested
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        console_handler.setLevel(logging.DEBUG)
+        print("Debug mode enabled - verbose logging activated")
     
     try:
         router = GatewayRouter(args.config)
@@ -703,10 +754,17 @@ def main():
         if args.port:
             router.config.config.set('SERVER', 'port', str(args.port))
             logger.info(f"Overriding port with command line argument: {args.port}")
+            print(f"Overriding port with command line argument: {args.port}")
         
+        print("Starting Gateway Router server...")
+        sys.stdout.flush()
         router.start()
     except Exception as e:
-        logger.error(f"Failed to start Gateway Router: {e}")
+        error_msg = f"Failed to start Gateway Router: {e}"
+        print(error_msg)
+        print(f"Error details: {traceback.format_exc()}")
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
         sys.exit(1)
 
 
