@@ -6,20 +6,36 @@ A Python-based gateway routing application that routes incoming requests
 to different backend servers based on URL patterns stored in an Oracle database.
 """
 
-import argparse
-import logging
-import uuid
 import os
 import sys
 import json
-from typing import Dict, Any, Optional, List
-import requests
+import uuid
+import logging
+import signal
+import argparse
+import platform
+import traceback
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+from urllib.parse import urlparse, urljoin
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import oracledb
-import configparser
-from urllib.parse import urlparse
 import socket
 import time
+import configparser
+from typing import Dict, Any, Optional, List
+
+# Third-party libraries (included in package)
+import requests
+try:
+    import oracledb
+except ImportError:
+    try:
+        import cx_Oracle as oracledb
+    except ImportError:
+        print("Error: Neither oracledb nor cx_Oracle package is installed.")
+        print("Install one of them using pip: pip install oracledb")
+        sys.exit(1)
 
 # Configure logging
 logging.basicConfig(
@@ -62,7 +78,8 @@ class Configuration:
         self.config['SERVERS'] = {
             'OBPM': 'http://obpm-server.example.com',
             'HOST': 'http://host-server.example.com',
-            'OBRH': 'http://obrh-server.example.com'
+            'OBRH': 'http://obrh-server.example.com',
+            'api-dev': 'https://api.restful-api.dev'
         }
         
         self.config['HOOKS'] = {
@@ -119,6 +136,13 @@ class DatabaseManager:
     def initialize(self):
         """Initialize the connection pool."""
         try:
+            # Try to use thin mode (pure Python implementation)
+            try:
+                oracledb.init_oracle_client(lib_dir=None)
+            except Exception:
+                # If failed, continue without initialization
+                pass
+                
             self.pool = oracledb.create_pool(
                 dsn=self.connection_string,
                 min=self.min_connections,
@@ -165,10 +189,47 @@ class DatabaseManager:
             logger.info("Database connection pool closed")
 
 
+class MockDatabaseManager:
+    """Mock database manager for testing."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        """Initialize the mock database manager."""
+        self.routes = [
+            {
+                'full_url': 'http://main.com/xzy/gfc',
+                'replaced_variables': 'OBPM'
+            },
+            {
+                'full_url': 'http://main.com/api/users',
+                'replaced_variables': 'HOST'
+            },
+            {
+                'full_url': 'http://main.com/api/orders',
+                'replaced_variables': 'OBRH'
+            },
+            {
+                'full_url': 'http://main.com/objects',
+                'replaced_variables': 'api-dev'
+            }
+        ]
+    
+    def initialize(self):
+        """No initialization needed for mock."""
+        logger.info("Mock database manager initialized")
+    
+    def get_routes(self) -> List[Dict[str, str]]:
+        """Return mock routes."""
+        return self.routes
+    
+    def close(self):
+        """No closing needed for mock."""
+        logger.info("Mock database manager closed")
+
+
 class RouteManager:
     """Manager for handling routing logic."""
     
-    def __init__(self, db_manager: DatabaseManager, servers_mapping: Dict[str, str]):
+    def __init__(self, db_manager, servers_mapping: Dict[str, str]):
         """Initialize the route manager with a database manager and servers mapping."""
         self.db_manager = db_manager
         self.servers_mapping = servers_mapping
@@ -196,18 +257,14 @@ class RouteManager:
             A dictionary with route information if found, None otherwise
         """
         parsed_url = urlparse(url)
-        path_with_query = parsed_url.path
-        if parsed_url.query:
-            path_with_query += f"?{parsed_url.query}"
+        path = parsed_url.path  # Changed to only match the path, not query
         
         for route in self.routes_cache:
             route_parsed = urlparse(route['full_url'])
-            route_path_with_query = route_parsed.path
-            if route_parsed.query:
-                route_path_with_query += f"?{route_parsed.query}"
+            route_path = route_parsed.path  # Changed to only match the path, not query
             
             # Match the path (after host:port)
-            if path_with_query == route_path_with_query:
+            if path == route_path:
                 logger.info(f"Found matching route for {url}: {route['full_url']}")
                 return route
         
@@ -271,11 +328,14 @@ class HookManager:
             try:
                 if hook_path:
                     module_path, function_name = hook_path.rsplit('.', 1)
-                    module = __import__(module_path, fromlist=[function_name])
-                    self.hooks[hook_name] = getattr(module, function_name)
-                    logger.info(f"Loaded hook {hook_name} from {hook_path}")
-            except (ImportError, AttributeError, ValueError) as e:
-                logger.warning(f"Failed to load hook {hook_name} from {hook_path}: {e}")
+                    try:
+                        module = __import__(module_path, fromlist=[function_name])
+                        self.hooks[hook_name] = getattr(module, function_name)
+                        logger.info(f"Loaded hook {hook_name} from {hook_path}")
+                    except (ImportError, AttributeError) as e:
+                        logger.warning(f"Failed to load hook {hook_name} from {hook_path}: {e}")
+            except ValueError as e:
+                logger.warning(f"Invalid hook path format for {hook_name}: {hook_path}")
     
     def execute_hook(self, hook_name: str, *args, **kwargs) -> Any:
         """
@@ -312,9 +372,25 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _set_response(self, status_code=200, headers=None):
         """Set the response status code and headers."""
         self.send_response(status_code)
+        
+        # Add debug logging for headers
+        logger.info(f"Setting response status code: {status_code}")
+        
         if headers:
+            logger.info(f"Setting response headers: {headers}")
             for header, value in headers.items():
-                self.send_header(header, value)
+                try:
+                    self.send_header(header, value)
+                except Exception as e:
+                    logger.error(f"Error setting header {header}: {str(e)}")
+        else:
+            logger.warning("No response headers provided")
+            
+        # Ensure Content-Type is set if not already
+        if headers and 'Content-Type' not in headers and 'content-type' not in [h.lower() for h in headers]:
+            logger.info("Adding default Content-Type header: application/json")
+            self.send_header('Content-Type', 'application/json')
+            
         self.end_headers()
     
     def _get_request_body(self) -> bytes:
@@ -388,18 +464,25 @@ class RequestHandler(BaseHTTPRequestHandler):
             headers_to_remove = ['Host', 'Content-Length']
             filtered_headers = {k: v for k, v in request_headers.items() if k not in headers_to_remove}
             
-            logger.info(f"[{trace_id}] Proxying {method} request to {target_url}")
+            # Log filtered headers being sent
+            logger.info(f"[{trace_id}] Sending request to {target_url} with headers: {filtered_headers}")
             
-            # Execute request to target server
+            # Execute request to target server - CRITICAL FIX: set stream=False to get full response immediately
             response = requests.request(
                 method=method,
                 url=target_url,
                 headers=filtered_headers,
                 data=request_body,
                 allow_redirects=False,
-                stream=True,
-                timeout=30  # Default timeout
+                stream=False,  # CRITICAL: This ensures we fully download content before proceeding
+                timeout=30     # Default timeout
             )
+            
+            # Immediately log the raw response details
+            logger.info(f"[{trace_id}] Raw response status: {response.status_code}")
+            logger.info(f"[{trace_id}] Raw response headers: {dict(response.headers)}")
+            logger.info(f"[{trace_id}] Raw response encoding: {response.encoding}")
+            logger.info(f"[{trace_id}] Raw response content length: {len(response.content) if response.content else 0} bytes")
             
             # Execute post-request hook
             modified_response = self.hook_manager.execute_hook('post_request', response, trace_id, target_url)
@@ -410,18 +493,63 @@ class RequestHandler(BaseHTTPRequestHandler):
             response_headers = {k: v for k, v in response.headers.items()}
             response_headers['X-Gateway-Trace-ID'] = trace_id
             
+            # CRITICAL FIX: Handle gzipped content correctly
+            if 'Content-Encoding' in response_headers and 'gzip' in response_headers['Content-Encoding'].lower():
+                logger.info(f"[{trace_id}] Content is gzipped, preserving Content-Encoding header")
+                # No need to decompress, requests already handles this internally
+            
             # Execute pre-response hook
             modified_headers = self.hook_manager.execute_hook('pre_response', response_headers, trace_id, target_url)
             if modified_headers and isinstance(modified_headers, dict):
                 response_headers = modified_headers
             
-            # Send response
+            # CRITICAL FIX: Handle Transfer-Encoding properly
+            if 'Transfer-Encoding' in response_headers and 'chunked' in response_headers['Transfer-Encoding'].lower():
+                logger.info(f"[{trace_id}] Chunked encoding detected, removing Transfer-Encoding header")
+                # Remove the Transfer-Encoding header as we're not actually chunking the response
+                del response_headers['Transfer-Encoding']
+            
+            # Ensure correct Content-Length
+            if 'Content-Length' not in response_headers and response.content:
+                content_length = len(response.content)
+                logger.info(f"[{trace_id}] Adding missing Content-Length header: {content_length}")
+                response_headers['Content-Length'] = str(content_length)
+            
+            # Debug check if we're processing application/json content
+            content_type = response_headers.get('Content-Type', '').lower()
+            if 'application/json' in content_type:
+                logger.info(f"[{trace_id}] JSON content detected, preview: {response.text[:200] if response.text else 'empty'}")
+            
+            # Send response headers
             self._set_response(response.status_code, response_headers)
             
-            # Stream response body
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    self.wfile.write(chunk)
+            # Enhanced debugging for response handling
+            logger.info(f"[{trace_id}] Response content type: {response.headers.get('Content-Type', 'None')}")
+            logger.info(f"[{trace_id}] Response content length: {len(response.content) if response.content else 0} bytes")
+            
+            # Log the response content for debugging (first 500 bytes)
+            if response.content:
+                content_preview = response.content[:500]
+                try:
+                    # Try to decode as UTF-8 for better logging
+                    content_str = content_preview.decode('utf-8')
+                    logger.info(f"[{trace_id}] Response content preview: {content_str}")
+                except UnicodeDecodeError:
+                    # If it's binary data, log the hex representation
+                    logger.info(f"[{trace_id}] Response content preview (binary): {content_preview.hex()[:100]}")
+                
+                # CRITICAL FIX: Send the response body with proper error handling
+                try:
+                    self.wfile.write(response.content)
+                    logger.info(f"[{trace_id}] Response body successfully written to client, length: {len(response.content)} bytes")
+                except BrokenPipeError:
+                    logger.error(f"[{trace_id}] Client disconnected while sending response (BrokenPipeError)")
+                except ConnectionResetError:
+                    logger.error(f"[{trace_id}] Connection reset by client while sending response")
+                except Exception as e:
+                    logger.error(f"[{trace_id}] Error writing response body to client: {str(e)}")
+            else:
+                logger.warning(f"[{trace_id}] Empty response body from {target_url}")
             
             # Calculate response time
             response_time_ms = (time.time() - request_start_time) * 1000
@@ -464,6 +592,12 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         """Handle OPTIONS requests."""
         self._proxy_request('OPTIONS')
+    
+    def log_message(self, format, *args):
+        """Override log_message to use our logger instead of stderr."""
+        # This prevents the default logging from http.server
+        # We're doing our own logging with the logger module
+        pass
 
 
 class HTTPServerV6(HTTPServer):
@@ -487,8 +621,17 @@ class GatewayRouter:
         """Initialize all components."""
         # Initialize database manager
         db_config = self.config.get_db_config()
-        self.db_manager = DatabaseManager(db_config)
-        self.db_manager.initialize()
+        
+        # Use mock database manager instead of real one for development
+        # self.db_manager = DatabaseManager(db_config)  # Real database
+        self.db_manager = MockDatabaseManager(db_config)  # Mock database
+        
+        try:
+            self.db_manager.initialize()
+        except Exception as e:
+            logger.warning(f"Could not initialize database, using mock: {e}")
+            self.db_manager = MockDatabaseManager(db_config)
+            self.db_manager.initialize()
         
         # Initialize route manager
         servers_mapping = self.config.get_servers_mapping()
@@ -519,7 +662,8 @@ class GatewayRouter:
             # Try IPv6 first
             self.server = HTTPServerV6((host, port), handler)
             logger.info(f"Starting server on [{host}]:{port} (IPv6)")
-        except Exception:
+        except Exception as e:
+            logger.info(f"IPv6 not supported, falling back to IPv4: {e}")
             # Fall back to IPv4
             self.server = HTTPServer((host, port), handler)
             logger.info(f"Starting server on {host}:{port} (IPv4)")
